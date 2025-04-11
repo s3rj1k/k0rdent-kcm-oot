@@ -1,0 +1,133 @@
+name: Publish KCM Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: 'Repository to check out'
+        required: true
+        type: choice
+        options:
+          - 's3rj1k/k0rdent-kcm'
+          - 'k0rdent/kcm'
+        default: 's3rj1k/k0rdent-kcm'
+      ref:
+        description: 'Git reference (branch, tag, commit hash)'
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Set variables
+        shell: bash
+        run: |
+          IMAGE_TAG="0.0.0-latest"
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+
+          echo "GIT_COMMIT=${GIT_COMMIT}" >> $GITHUB_ENV
+          echo "VERSION=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "CHART_VERSION=${IMAGE_TAG}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=ghcr.io/${{ github.repository }}/controller:${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Replace image references in source code
+        shell: bash
+        run: |
+          # echo "Find all files that might contain the image reference"
+          find . -type f -not -path "./.git/*" -exec grep -l "ghcr.io/k0rdent/kcm" {} \; > files_to_modify.txt
+
+          # echo "Replace all occurrences of the old image reference with the new one"
+          if [ -s files_to_modify.txt ]; then
+            while IFS= read -r file; do
+              echo "Updating references in $file"
+              sed -i "s|ghcr.io/k0rdent/kcm|ghcr.io/${{ github.repository }}|g" "$file"
+            done < files_to_modify.txt
+          fi
+
+      - name: Prepare all charts
+        shell: bash
+        run: |
+          CHART_DIRS=$(find ./templates -name "Chart.yaml" -type f | xargs -I{} dirname {} | sort)
+          if [ -z "$CHART_DIRS" ]; then
+            exit 0
+          fi
+
+          # echo "Adding annotations to all charts and preparing them for release"
+          for chart_dir in $CHART_DIRS; do
+            CHART_YAML="$chart_dir/Chart.yaml"
+            if [ -f "$CHART_YAML" ]; then
+              echo "Adding annotations to $CHART_YAML"
+              yq e '.annotations."github.com/source-repo" = "${{ inputs.repository }}"' -i "$CHART_YAML"
+              yq e '.annotations."github.com/git-commit" = env(GIT_COMMIT)' -i "$CHART_YAML"
+            fi
+          done
+
+      - name: Commit changes to source code
+        shell: bash
+        run: |
+          echo "---"
+          git diff
+          echo "---"
+          git add -A && git commit -m "Update image references and chart annotations"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push KCM controller image
+        uses: docker/build-push-action@v6
+        with:
+          build-args: |
+            LD_FLAGS=-s -w -X github.com/K0rdent/kcm/internal/build.Version=${{ env.VERSION }}
+          context: .
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.IMAGE_NAME }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ inputs.repository }}
+            org.opencontainers.image.revision=${{ env.GIT_COMMIT }}
+            org.opencontainers.image.created=${{ github.event.repository.created_at }}
+
+      - name: Push all charts to GHCR
+        run: REGISTRY_REPO="oci://ghcr.io/${{ github.repository }}/charts" make helm-push
+
+      - name: Write installation instructions to summary
+        shell: bash
+        run: |
+          echo "## Image Digest" >> $GITHUB_STEP_SUMMARY
+          echo "Source Repository: ${{ inputs.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "Git Reference: ${{ inputs.ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "Git Commit: ${{ env.GIT_COMMIT }}" >> $GITHUB_STEP_SUMMARY
+
+          echo "## KCM Chart Installation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "```shell" >> $GITHUB_STEP_SUMMARY
+          echo "helm install kcm oci://ghcr.io/${{ github.repository }}/charts/kcm --version ${{ env.CHART_VERSION }} -n kcm-system --create-namespace" >> $GITHUB_STEP_SUMMARY
+          echo "```" >> $GITHUB_STEP_SUMMARY
